@@ -10,7 +10,7 @@ from prophet import Prophet
 
 # Authenticate & initialize with your Project ID
 ee.Authenticate()
-ee.Initialize(project='potent-bloom-463501-i9')
+ee.Initialize(project='project-id')
 
 # ───────────────────────────────────────────────────
 # 2️⃣ Interactive AOI drawing
