@@ -1,72 +1,38 @@
-# 0️⃣ Install dependencies
-!pip install --quiet geemap earthengine-api ipywidgets prophet
-
-# 1️⃣ Imports & init
+# ─── IMPORTS ─────────────────────────────────────────────────────────────────
+!pip install --quiet geemap earthengine-api ipywidgets prophet google-generativeai
 import ee, geemap
-import ipywidgets as widgets
-from IPython.display import display, clear_output
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import ipywidgets as widgets
 from prophet import Prophet
+from IPython.display import display, clear_output, Markdown
+from PIL import Image
+import google.generativeai as genai
 
-# Authenticate & initialize with your Project ID
+# ─── GOOGLE EARTH ENGINE SETUP ──────────────────────────────────────────────
 ee.Authenticate()
-ee.Initialize(project='project-id')
+ee.Initialize(project='projeto-id')
 
-# ───────────────────────────────────────────────────
-# 2️⃣ Interactive AOI drawing
+# ─── GEMINI SETUP ───────────────────────────────────────────────────────────
+genai.configure(api_key='GEMINI_API_KEY')  # 🔒 Substitua pela sua chave segura
+gemini = genai.GenerativeModel("gemini-2.5-flash")
+
+# ─── MAPA INTERATIVO ────────────────────────────────────────────────────────
 m = geemap.Map(center=[0,0], zoom=2)
 m.add_basemap('SATELLITE')
 m.add_draw_control()
 display(m)
 
-# ───────────────────────────────────────────────────
-# 3️⃣ UI widgets (all keyword args)
-
-collection_input = widgets.Text(
-    value='COPERNICUS/S2',
-    description='Collection:'
-)
-
-start_date = widgets.Text(
-    value='2022-01-01',
-    description='Start Date:'
-)
-
-end_date = widgets.Text(
-    value='2022-12-31',
-    description='End Date:'
-)
-
-cloud_pct = widgets.IntSlider(
-    value=20,
-    min=0,
-    max=100,
-    description='Max Cloud %:'
-)
-
-operator = widgets.Dropdown(
-    options=['median','mean','min','max','mosaic'],
-    value='median',
-    description='Operator:'
-)
-
-export_name = widgets.Text(
-    value='sat_image',
-    description='Export name:'
-)
-
-scale_m = widgets.IntSlider(
-    value=10,
-    min=10,
-    max=100,
-    step=10,
-    description='Scale (m):'
-)
-
-run_button = widgets.Button(
-    description='Run & Export',
-    button_style='success'
-)
+# ─── UI WIDGETS ─────────────────────────────────────────────────────────────
+collection_input = widgets.Text(value='COPERNICUS/S2', description='Collection:')
+start_date = widgets.Text(value='2022-01-01', description='Start Date:')
+end_date = widgets.Text(value='2022-12-31', description='End Date:')
+cloud_pct = widgets.IntSlider(value=20, min=0, max=100, description='Max Cloud %:')
+operator = widgets.Dropdown(options=['median','mean','min','max','mosaic'], value='median', description='Operator:')
+export_name = widgets.Text(value='sat_image', description='Export name:')
+scale_m = widgets.IntSlider(value=10, min=10, max=100, step=10, description='Scale (m):')
+run_button = widgets.Button(description='Run & Export', button_style='success')
 
 ui = widgets.VBox([
     collection_input,
@@ -79,93 +45,137 @@ ui = widgets.VBox([
 ])
 display(ui)
 
-# ───────────────────────────────────────────────────
-# 4️⃣ Monthly NDVI extraction + forecast
+# ─── FUNÇÕES DE PROCESSAMENTO ───────────────────────────────────────────────
 
 def extract_monthly_ndvi(aoi, collection_id, start, end, scale):
-    """Return DataFrame with monthly mean NDVI for AOI."""
     def monthly_mean(year, month):
         s = f'{year}-{month:02d}-01'
         e = f'{year}-{month:02d}-28'
         img = ee.ImageCollection(collection_id)\
-                .filterBounds(aoi)\
-                .filterDate(s, e)\
-                .select('B8','B4')  # Sentinel-2: NIR=B8, Red=B4
-        ndvi = img.map(lambda i: i.normalizedDifference(['B8','B4']))\
+            .filterBounds(aoi).filterDate(s, e).select('B8','B4')
+        ndvi = img.map(lambda i: i.normalizedDifference(['B8','B4']).rename('nd'))\
                   .mean()\
-                  .reduceRegion(
-                      ee.Reducer.mean(), aoi, scale
-                  )\
+                  .reduceRegion(ee.Reducer.mean(), aoi, scale)\
                   .get('nd')
         return [s, ndvi.getInfo()]
-    start_dt = pd.to_datetime(start)
-    end_dt   = pd.to_datetime(end)
-    months = pd.date_range(start_dt, end_dt, freq='MS')
+    months = pd.date_range(start=start, end=end, freq='MS')
     data = [monthly_mean(d.year, d.month) for d in months]
     df = pd.DataFrame(data, columns=['ds','y'])
     df['ds'] = pd.to_datetime(df['ds'])
     return df
 
 def forecast_ndvi(df):
-    """Fit Prophet and forecast next 6 months."""
     m = Prophet()
     m.fit(df)
     future = m.make_future_dataframe(periods=6, freq='MS')
     fc = m.predict(future)
     return m, fc
 
-# ───────────────────────────────────────────────────
-# 5️⃣ Main pipeline callback
+def compute_index(img, bands, name):
+    return img.normalizedDifference(bands).rename(name)
+
+def mean_over_aoi(img, aoi, scale):
+    stat = img.reduceRegion(ee.Reducer.mean(), aoi, scale)
+    return stat.values().get(0).getInfo()
+
+def generate_gemini_insight(image_path, prompt):
+    image = Image.open(image_path)
+    response = gemini.generate_content([prompt, image])
+    return response.text
+
+# ─── CALLBACK PRINCIPAL ─────────────────────────────────────────────────────
 
 def on_run(b):
     clear_output(wait=True)
     display(m, ui)
 
-    # AOI
     aoi = m.user_roi
     if aoi is None:
-        print("⚠️ Draw your AOI first.")
+        print("⚠️ Desenhe uma área primeiro.")
         return
 
-    # Image collection
     col = ee.ImageCollection(collection_input.value)\
-            .filterBounds(aoi)\
-            .filterDate(start_date.value, end_date.value)
-    # Cloud filter
+        .filterBounds(aoi).filterDate(start_date.value, end_date.value)
     props = col.first().propertyNames().getInfo()
     if 'CLOUDY_PIXEL_PERCENTAGE' in props:
         col = col.filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', cloud_pct.value))
 
-    # Apply operator & clip
     op = operator.value
-    if op=='median': img = col.median()
-    elif op=='mean': img = col.mean()
-    elif op=='min':   img = col.min()
-    elif op=='max':   img = col.max()
-    else:            img = col.mosaic()
+    if op == 'median': img = col.median()
+    elif op == 'mean': img = col.mean()
+    elif op == 'min': img = col.min()
+    elif op == 'max': img = col.max()
+    else: img = col.mosaic()
     img = img.clip(aoi)
 
-    # Display on map
-    m.clear_layers(); m.add_basemap('SATELLITE')
-    m.addLayer(aoi, {'color':'red'}, 'AOI')
-    vis = {'bands':['B4','B3','B2'],'min':0,'max':3000}
-    m.addLayer(img, vis, 'Processed')
-    display(m)
-
-    # Extract & forecast NDVI
-    print("📈 Extracting monthly NDVI…")
-    df = extract_monthly_ndvi(
+    # NDVI mensal + previsão
+    df_ndvi = extract_monthly_ndvi(
         aoi, collection_input.value,
         start_date.value, end_date.value,
         scale_m.value
     )
-    print(df.tail())
-    m_prophet, fc = forecast_ndvi(df)
-    fig = m_prophet.plot(fc)
+    model_prophet, forecast = forecast_ndvi(df_ndvi)
+
+    # ─ Visualização consolidada ─
+    fig, axs = plt.subplots(1, 2, figsize=(12,4))
+
+    # Gráfico NDVI + previsão
+    model_prophet.plot(forecast, ax=axs[0])
+    axs[0].set_title('Previsão NDVI')
+
+    # Cálculo de índices
+    ndvi = compute_index(img, ['B8','B4'], 'NDVI')
+    ndbi = compute_index(img, ['B11','B8'], 'NDBI')
+    ndwi = compute_index(img, ['B3','B8'], 'NDWI')
+    nbr  = compute_index(img, ['B8','B12'], 'NBR')
+    b8 = img.select('B8'); b4 = img.select('B4')
+    savi = b8.subtract(b4).divide(b8.add(b4).add(0.5)).multiply(1.5).rename('SAVI')
+
+    df_indices = pd.DataFrame({
+        'Index': ['NDVI','NDBI','NDWI','NBR','SAVI'],
+        'Mean': [
+            mean_over_aoi(ndvi, aoi, scale_m.value),
+            mean_over_aoi(ndbi, aoi, scale_m.value),
+            mean_over_aoi(ndwi, aoi, scale_m.value),
+            mean_over_aoi(nbr, aoi, scale_m.value),
+            mean_over_aoi(savi, aoi, scale_m.value),
+        ]
+    })
+
+    # Flags de risco
+    df_indices['Risk_Flag'] = False
+    df_indices.loc[df_indices.Index=='NDVI', 'Risk_Flag'] = df_indices.Mean < 0.4
+    df_indices.loc[df_indices.Index=='NDBI', 'Risk_Flag'] = df_indices.Mean > 0.3
+    df_indices.loc[df_indices.Index=='NDWI', 'Risk_Flag'] = df_indices.Mean > 0
+    df_indices.loc[df_indices.Index=='NBR',  'Risk_Flag'] = df_indices.Mean < 0.1
+    df_indices.loc[df_indices.Index=='SAVI', 'Risk_Flag'] = df_indices.Mean < 0.3
+
+    # Gráfico dos índices
+    axs[1].bar(df_indices['Index'], df_indices['Mean'], color=['green','gray','blue','red','olive'])
+    axs[1].axhline(0, color='black', lw=0.5)
+    axs[1].set_title("Índices Médios")
+
+    # Salvar imagem
+    fig.tight_layout()
+    fig.savefig("grafico_final.png")
     display(fig)
 
-    # Export GeoTIFF
-    print("💾 Exporting image…")
+    # Mostrar tabela
+    print("📊 Tabela de índices com risco:")
+    display(df_indices)
+
+    # Insight automático com Gemini
+    prompt = (
+        "Este gráfico mostra a evolução temporal do NDVI (índice de vegetação) e os valores médios de índices ambientais "
+        "como NDVI, NDBI, NDWI, NBR e SAVI em uma determinada área. Analise os padrões sazonais, a saúde da vegetação, "
+        "sinais de urbanização ou degradação ambiental, e possíveis riscos identificados."
+    )
+    print("🧠 Gerando insight automático com Gemini...")
+    insight = generate_gemini_insight("grafico_final.png", prompt)
+    display(Markdown(f"### 🔎 Insight gerado automaticamente:\n\n{insight}"))
+
+    # Exportar imagem para o Drive
+    print("💾 Exportando imagem para o Google Drive…")
     task = ee.batch.Export.image.toDrive(
         image=img,
         description=export_name.value,
@@ -176,95 +186,6 @@ def on_run(b):
         crs='EPSG:4326'
     )
     task.start()
-    print(f"🚀 Export started as '{export_name.value}' in Drive/gee_exports")
+    print(f"🚀 Exportação iniciada: '{export_name.value}' em Drive/gee_exports")
 
 run_button.on_click(on_run)
-
-# ───────────────────────────────────────────────────
-# End of notebook
-
-# ───────────────────────────────────────────────────
-# Block 2: Index Measurement & Risk Detection
-
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-# 1️⃣ Ensure AOI is drawn
-aoi = m.user_roi
-if aoi is None:
-    raise Exception("⚠️ Draw your AOI on the map first!")
-
-# 2️⃣ Select a single representative image (median) from previously filtered collection
-# (reuse collection from Block 1 or redefine here)
-col = ee.ImageCollection(collection_input.value) \
-        .filterBounds(aoi) \
-        .filterDate(start_date.value, end_date.value)
-# cloud filter if available
-props = col.first().propertyNames().getInfo()
-if 'CLOUDY_PIXEL_PERCENTAGE' in props:
-    col = col.filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', cloud_pct.value))
-img = col.median().clip(aoi)
-
-# 3️⃣ Functions to compute indices
-def compute_index(img, bands, name):
-    """Normalized difference index: (b1 - b2)/(b1 + b2)"""
-    nd = img.normalizedDifference(bands).rename(name)
-    return nd
-
-# Compute each index
-ndvi = compute_index(img, ['B8','B4'], 'NDVI')    # Sentinel-2 NIR/Red
-ndbi = compute_index(img, ['B11','B8'], 'NDBI')   # SWIR/NIR
-ndwi = compute_index(img, ['B3','B8'], 'NDWI')    # Green/NIR
-nbr  = compute_index(img, ['B8','B12'], 'NBR')    # NIR/SWIR2
-# SAVI: (NIR - Red)/(NIR + Red + L)*(1+L), L=0.5
-b8 = img.select('B8').rename('NIR')
-b4 = img.select('B4').rename('RED')
-savi = b8.subtract(b4).divide(b8.add(b4).add(0.5)).multiply(1.5).rename('SAVI')
-
-# 4️⃣ Reduce each index to mean over AOI
-def mean_over_aoi(index_img):
-    stat = index_img.reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=aoi,
-        scale=scale_m.value
-    )
-    return stat.values().get(0).getInfo()
-
-results = {
-    'Index': ['NDVI','NDBI','NDWI','NBR','SAVI'],
-    'Mean': [
-        mean_over_aoi(ndvi),
-        mean_over_aoi(ndbi),
-        mean_over_aoi(ndwi),
-        mean_over_aoi(nbr),
-        mean_over_aoi(savi)
-    ]
-}
-
-df = pd.DataFrame(results)
-
-# 5️⃣ Simple risk thresholds (tweak as needed)
-df['Risk_Flag'] = False
-# Vegetation stress if NDVI < 0.4
-df.loc[df.Index=='NDVI','Risk_Flag'] = df.Mean < 0.4
-# Urban expansion concern if NDBI > 0.3
-df.loc[df.Index=='NDBI','Risk_Flag'] = df.Mean > 0.3
-# Flood risk if NDWI > 0
-df.loc[df.Index=='NDWI','Risk_Flag'] = df.Mean > 0
-# Fire burn indication if NBR < 0.1
-df.loc[df.Index=='NBR','Risk_Flag'] = df.Mean < 0.1
-# Low vegetation with SAVI < 0.3
-df.loc[df.Index=='SAVI','Risk_Flag'] = df.Mean < 0.3
-
-# 6️⃣ Display table
-print("📊 Mean index values and risk flags for your AOI:")
-display(df)
-
-# 7️⃣ Bar chart
-plt.figure(figsize=(8,4))
-plt.bar(df['Index'], df['Mean'], color=['green','grey','blue','red','olive'])
-plt.axhline(0, color='black', linewidth=0.5)
-plt.title('Mean Indices over AOI')
-plt.ylabel('Mean value')
-plt.show()
